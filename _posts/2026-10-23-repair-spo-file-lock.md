@@ -53,7 +53,9 @@ The code uses SharePoint CSOM and REST, with no explicit Microsoft Graph calls o
 Download the script, save it as `Repair-SPOFileLock.ps1`, and start with a diagnosis:
 
 ```powershell
-./Repair-SPOFileLock.ps1 -FileUrl "https://contoso.sharepoint.com/sites/QA/Documents/Test.docx" -ClientId "<your-app-client-id>"
+./Repair-SPOFileLock.ps1 `
+    -FileUrl "https://contoso.sharepoint.com/sites/QA/Documents/Test.docx" `
+    -ClientId "<your-app-client-id>"
 ```
 
 All examples use placeholder values. Replace them with your own approved test resource.
@@ -67,7 +69,9 @@ For subsites or nonstandard URL structures, supply `-SiteUrl` explicitly. The sc
 ## 2. Scan a library
 
 ```powershell
-./Repair-SPOFileLock.ps1 -LibraryUrl "https://contoso.sharepoint.com/sites/QA/Documents" -ClientId "<your-app-client-id>"
+./Repair-SPOFileLock.ps1 `
+    -LibraryUrl "https://contoso.sharepoint.com/sites/QA/Documents" `
+    -ClientId "<your-app-client-id>"
 ```
 
 The scan walks visible files recursively across file types. Library view filters are ignored. Review the CSV, then investigate affected files individually.
@@ -79,7 +83,13 @@ A completed enumeration is limited to what the account can see. Failed file read
 Ask the user to save their work and close relevant Office and browser sessions, including sessions on other devices. Then observe the file:
 
 ```powershell
-./Repair-SPOFileLock.ps1 -FileUrl "https://contoso.sharepoint.com/sites/QA/Documents/Test.docx" -ClientId "<your-app-client-id>" -Action WaitForRelease -ClientSessionsClosed -WaitSeconds 600 -PollSeconds 15
+./Repair-SPOFileLock.ps1 `
+    -FileUrl "https://contoso.sharepoint.com/sites/QA/Documents/Test.docx" `
+    -ClientId "<your-app-client-id>" `
+    -Action WaitForRelease `
+    -ClientSessionsClosed `
+    -WaitSeconds 600 `
+    -PollSeconds 15
 ```
 
 The defaults are 600 seconds of waiting and 15 seconds between polls. A clear final observation means no checkout or editing lock was reported at that instant. It does not establish the age of a lock, a lease expiry, or proof that a persistent lock is orphaned.
@@ -89,7 +99,12 @@ The defaults are 600 seconds of waiting and 15 seconds between polls. A clear fi
 Only use `-ClientSessionsClosed` after confirming that editing sessions are closed and saved changes have been reconciled.
 
 ```powershell
-./Repair-SPOFileLock.ps1 -FileUrl "https://contoso.sharepoint.com/sites/QA/Documents/Test.docx" -ClientId "<your-app-client-id>" -Action CheckIn -ClientSessionsClosed -WhatIf
+./Repair-SPOFileLock.ps1 `
+    -FileUrl "https://contoso.sharepoint.com/sites/QA/Documents/Test.docx" `
+    -ClientId "<your-app-client-id>" `
+    -Action CheckIn `
+    -ClientSessionsClosed `
+    -WhatIf
 ```
 
 `-WhatIf` prevents remote changes, but the script still authenticates, reads the file, and writes local audit reports. It does not exercise the backup or prove that a subsequent check-in will succeed.
