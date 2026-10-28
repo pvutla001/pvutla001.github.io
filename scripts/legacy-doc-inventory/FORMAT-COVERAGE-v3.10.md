@@ -1,5 +1,7 @@
 # Word format coverage — v3.10
 
+> v3.10.1 retains this format coverage and corrects local document path handling. See README.md and VALIDATION-v3.10.json for the patch tests.
+
 These 29 additional samples passed the expected-result tests and actual isolated scanner/report pipeline: 25 complete inspections, four expected review records, no processing failures. Five containers retained a VBA project. VBA was never executed. All 366 regression checks passed. The separately tested live library had 57 matching documents and no processing errors.
 
 | Sample | Actual format | Scan status | VBA indicators | Projects | Effective FIB |

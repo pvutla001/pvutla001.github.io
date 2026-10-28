@@ -165,7 +165,7 @@ function Invoke-InventoryScan([string]$Path,$Config) {
         }
         $result=[IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
         if(-not $result.PSObject.Properties['SchemaVersion'] -or $result.SchemaVersion -ne '2.0'){throw 'Scanner result schema mismatch; use the matching v3.10 helper files.'}
-        if([IO.Path]::GetFullPath($result.FilePath) -ine [IO.Path]::GetFullPath($Path)){throw 'Scanner result input path does not match the requested document.'}
+        if([SPOInventoryV310.LocalIO]::FullPath($result.FilePath) -ine [SPOInventoryV310.LocalIO]::FullPath($Path)){throw 'Scanner result input path does not match the requested document.'}
         return $result
     } finally {if($process){$process.Dispose()};if([IO.File]::Exists($resultPath)){[IO.File]::Delete($resultPath)}}
 }
@@ -178,10 +178,9 @@ function Invoke-InventoryDownload($Context,$Config,$Row) {
         if($layout -eq 'Mirror'){$local=[SPOInventoryV310.LocalIO]::Mirror($Config.DownloadRoot,$Row.LibraryRelativePath)}
         else{$local=[IO.Path]::Combine($Config.DownloadRoot,('{0}_{1}.doc' -f [long]$Row.ItemId,$safeId))}
         $Row.Notes='Local snapshot uses '+$layout+' layout; original SharePoint name/path and local mapping are recorded.'
-        $native=[SPOInventoryV310.LocalIO]::Extended($local)
-        if([IO.File]::Exists($native)){throw 'Download target already exists; refusing overwrite.'}
-        $directory=[IO.Path]::GetDirectoryName($local);[void][IO.Directory]::CreateDirectory([SPOInventoryV310.LocalIO]::Extended($directory))
-        $partial=[IO.Path]::Combine($directory,'.inventory_'+[guid]::NewGuid().ToString('N')+'.partial')
+        if([SPOInventoryV310.LocalIO]::FileExists($local)){throw 'Download target already exists; refusing overwrite.'}
+        $directory=[SPOInventoryV310.LocalIO]::Parent($local);[SPOInventoryV310.LocalIO]::CreateDirectory($directory)
+        $partial=$directory+'\.inventory_'+[guid]::NewGuid().ToString('N')+'.partial'
         $stage='Download'
         for($attempt=0;;$attempt++) {
             $stream=$null
@@ -202,13 +201,13 @@ function Invoke-InventoryDownload($Context,$Config,$Row) {
                 [SPOInventoryV310.LocalIO]::CopyLimited($stream,$partial,$Config.MaxBytes)
                 break
             } catch {
-                if([IO.File]::Exists([SPOInventoryV310.LocalIO]::Extended($partial))){[IO.File]::Delete([SPOInventoryV310.LocalIO]::Extended($partial))}
+                [SPOInventoryV310.LocalIO]::Delete($partial)
                 if($attempt -ge $Config.RetryCount -or -not $Config.Gate.Backoff($_.Exception,$attempt)){throw}
                 $Config.Gate.Wait()
             } finally {if($stream){$stream.Dispose()}}
         }
-        [IO.File]::Move([SPOInventoryV310.LocalIO]::Extended($partial),$native)
-        $Row.DownloadStatus='Downloaded';$Row.LocalPath=$local;$Row.DownloadedBytes=([IO.FileInfo]::new($native)).Length
+        [SPOInventoryV310.LocalIO]::Move($partial,$local)
+        $Row.DownloadStatus='Downloaded';$Row.LocalPath=$local;$Row.DownloadedBytes=[SPOInventoryV310.LocalIO]::Length($local)
         $stage='HashSnapshot';$Row.SHA256=[SPOInventoryV310.LocalIO]::Hash($local)
         if($Row.DownloadedBytes -ne $expectedLength){Add-InventoryIssue $Row ([pscustomobject]@{Severity='Warning';Code='DownloadSizeChanged';Stage='Download';Message="Expected $expectedLength bytes; received $($Row.DownloadedBytes). Server content may have changed during download."})}
         if($Config.Scan){
@@ -230,7 +229,7 @@ function Invoke-InventoryDownload($Context,$Config,$Row) {
         Add-InventoryIssue $Row (ConvertTo-InventoryError $_ $stage 'DocumentProcessingError')
         if($Config.Scan -and $Row.ScanStatus -eq 'NotRequested'){$Row.ScanStatus='Unknown';if($Config.CheckVBA){$Row.VBA='Unknown'};if($Config.CheckMacro){$Row.Macro='Unknown'};if($Config.CheckBoth){$Row.Both='Unknown'}}
     } finally {
-        if($partial -and [IO.File]::Exists([SPOInventoryV310.LocalIO]::Extended($partial))){try{[IO.File]::Delete([SPOInventoryV310.LocalIO]::Extended($partial))}catch{Add-InventoryIssue $Row (ConvertTo-InventoryError $_ 'CleanupDownload' 'PartialFileCleanupFailed')}}
+        if($partial){try{[SPOInventoryV310.LocalIO]::Delete($partial)}catch{Add-InventoryIssue $Row (ConvertTo-InventoryError $_ 'CleanupDownload' 'PartialFileCleanupFailed')}}
     }
 }
 function Invoke-InventoryBatch($Context,$Config,$Page) {

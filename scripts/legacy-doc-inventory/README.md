@@ -1,6 +1,16 @@
-# SharePoint legacy Word inventory v3.10
+# SharePoint legacy Word inventory v3.10.1
 
 [Read the full guide](https://pvutla001.github.io/sharepoint/legacy-doc-inventory/).
+
+## v3.10.1: fix for Windows PowerShell path errors
+
+Version **3.10.1** fixes repeated download failures such as `Exception calling "CreateDirectory": Illegal characters in path`. The v3.10 engine passed a `\\?\` device path to a .NET Framework string-path API. Hosts using legacy path validation could reject that prefix in `FileIOPermission`, even for a short, valid destination. The failure occurred while preparing the local download directory, before Word format or VBA inspection.
+
+The correction covers directory creation, file existence checks, download streams, partial-file renaming and cleanup, snapshot length/hash reads, mirrored-path checks, scanner input/output and path-identity comparison. Document I/O now uses Windows Unicode file APIs and handle-based .NET streams, preserving long paths without changing the registry or `powershell.exe.config`. Microsoft describes the [Framework compatibility behavior](https://learn.microsoft.com/en-us/dotnet/framework/migration-guide/mitigation-path-normalization), [Unicode directory API](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw) and [handle-based FileStream constructor](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.-ctor?view=netframework-4.8).
+
+**Upgrade all four runtime files together, then start a fresh Windows PowerShell 5.1 STA process.** Commands and dependencies remain the same. The summary identifies version `3.10.1`, and the log records the host's path settings without changing them. Windows file failures include the operation, path and Win32 error number. No Python, additional module, separate C# SDK or app registration is introduced by this fix.
+
+Long-path support here applies to retained document files, including deep `Mirror` layouts. Keep the script, module and report roots short because the launcher and reporting code still use standard PowerShell/.NET path APIs; for example, use `C:\Tools\SPOInventory` and `-OutputDirectory 'C:\SPOReports'`. Windows/filesystem component limits and access controls still apply. The former `v3.10.zip` download address remains a compatibility alias for the corrected package.
 
 ## Required files
 
@@ -63,4 +73,4 @@ Word97PlusOLE is a normal Word binary label. The scanner also recognizes support
 
 Unknown/Unsupported/Partial require review. Encrypted content and unresolved HTML sidecars are not macro-free findings. WordBasic, packed embedded objects, external templates and compiled-only/stomped VBA are not exhaustively assessed. NotDetected is not a safety verdict or a guarantee of Word Online compatibility.
 
-366 regression checks passed; the live QA run processed 57 matching documents with zero processing failures. These results are not a 200,000-file tenant benchmark. See the public validation summary and full guide for limits. Source files match the validated release; all examples use generic tenant URLs.
+476 offline regression checks passed for v3.10.1, including both .NET path-compatibility modes, 12 folder levels and 455-character paths. The 57-document live QA result belongs to the earlier v3.10 release; no new tenant run or 200,000-file benchmark was performed for this patch. See VALIDATION-v3.10.json for the current patch evidence and limitations.

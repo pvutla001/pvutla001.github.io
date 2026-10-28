@@ -1,17 +1,17 @@
 ---
 layout: post
-title: "Inventory legacy Word documents in SharePoint Online with PowerShell v3.10"
+title: "Inventory legacy Word documents in SharePoint Online with PowerShell v3.10.1"
 date: 2026-10-26 12:00:00 -0400
-last_modified_at: 2026-10-28 12:00:00 -0400
+last_modified_at: 2026-10-28 08:34:48 -0400
 categories: [sharepoint, powershell]
 tags: [legacy-documents, vba, macros, metadata, folder-counts, word97plusole, mhtml, flat-opc]
 permalink: /sharepoint/legacy-doc-inventory/
-excerpt: "Count legacy .doc files without downloads, export useful metadata, inspect more Word formats for VBA indicators, and review detailed Excel reports with the four-file v3.10 solution."
+excerpt: "Count legacy .doc files without downloads, export useful metadata, inspect more Word formats for VBA indicators, and review detailed Excel reports with the four-file v3.10.1 solution."
 ---
 
 *A practical guide to Export-SPOLegacyDocInventory.ps1: folder counts, useful metadata, format identification, VBA indicators and detailed Excel reports.*
 
-**Updated October 28, 2026 · Version 3.10.** This article replaces the earlier v3.1 guide at the same address. Download all four matching v3.10 files together.
+**Updated October 28, 2026 · Version 3.10.1.** This update fixes Windows PowerShell 5.1 path-validation failures. The article remains at the same address; download all four matching files together.
 
 A library can contain thousands of files named `.doc` without every file using the same underlying format. Some are Word binary documents, some contain VBA, and others are RTF, XML or web exports saved with a `.doc` extension. A filename inventory tells you where those files are. Content inspection adds evidence about what those files contain and which ones need further review.
 
@@ -27,11 +27,21 @@ A migration team can identify folders with the highest concentration of legacy d
 
 A high `.doc` count identifies a concentration of legacy files; it does not prove those files are broken. Likewise, detecting VBA does not establish that VBA caused a Word Online error. The report supports triage and planning. It does not convert documents, execute macros, repair Word files or release editing locks.
 
-## Download v3.10: four required files
+## v3.10.1: fix for Windows PowerShell path errors
+
+Version **3.10.1** fixes repeated download failures such as `Exception calling "CreateDirectory": Illegal characters in path`. The v3.10 engine passed a `\\?\` device path to a .NET Framework string-path API. Hosts using legacy path validation could reject that prefix in `FileIOPermission`, even for a short, valid destination. The failure occurred while preparing the local download directory, before Word format or VBA inspection.
+
+The correction covers directory creation, file existence checks, download streams, partial-file renaming and cleanup, snapshot length/hash reads, mirrored-path checks, scanner input/output and path-identity comparison. Document I/O now uses Windows Unicode file APIs and handle-based .NET streams, preserving long paths without changing the registry or `powershell.exe.config`. Microsoft describes the [Framework compatibility behavior](https://learn.microsoft.com/en-us/dotnet/framework/migration-guide/mitigation-path-normalization), [Unicode directory API](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createdirectoryw) and [handle-based FileStream constructor](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.-ctor?view=netframework-4.8).
+
+**Upgrade all four runtime files together, then start a fresh Windows PowerShell 5.1 STA process.** Commands and dependencies remain the same. The summary identifies version `3.10.1`, and the log records the host's path settings without changing them. Windows file failures include the operation, path and Win32 error number. No Python, additional module, separate C# SDK or app registration is introduced by this fix.
+
+Long-path support here applies to retained document files, including deep `Mirror` layouts. Keep the script, module and report roots short because the launcher and reporting code still use standard PowerShell/.NET path APIs; for example, use `C:\Tools\SPOInventory` and `-OutputDirectory 'C:\SPOReports'`. Windows/filesystem component limits and access controls still apply. The former `v3.10.zip` download address remains a compatibility alias for the corrected package.
+
+## Download v3.10.1: four required files
 
 The main script loads its helpers automatically; you normally execute only the entry point.
 
-<p><a class="pv-button pv-primary" style="color:#fff" href="/scripts/legacy-doc-inventory/Export-SPOLegacyDocInventory-v3.10.zip" download="Export-SPOLegacyDocInventory-v3.10.zip">Download v3.10 ZIP</a> <a class="pv-button" href="https://github.com/pvutla001/pvutla001.github.io/tree/main/scripts/legacy-doc-inventory">Browse the source</a></p>
+<p><a class="pv-button pv-primary" style="color:#fff" href="/scripts/legacy-doc-inventory/Export-SPOLegacyDocInventory-v3.10.1.zip" download="Export-SPOLegacyDocInventory-v3.10.1.zip">Download v3.10.1 ZIP</a> <a class="pv-button" href="https://github.com/pvutla001/pvutla001.github.io/tree/main/scripts/legacy-doc-inventory">Browse the source</a></p>
 
 | Required file | Purpose | Source | Download |
 | --- | --- | --- | --- |
@@ -42,7 +52,7 @@ The main script loads its helpers automatically; you normally execute only the e
 
 The ZIP contains **these four production files and four optional reference files**: `README.md`, `FORMAT-COVERAGE-v3.10.md`, `VALIDATION-v3.10.json` and `SHA256SUMS.txt`. It contains no test fixtures, development builders, historical run logs, downloaded SharePoint documents or PnP module binaries. Tests, fixture builders and historical run results are optional development resources; the four production files do not load them.
 
-If a browser displays a script as text, use **Save link as** and retain its `.ps1` or `.cs` extension. Do not save a GitHub HTML page as the script. The runtime files match the validated v3.10 release; do not mix them with v3.1 or another helper version.
+If a browser displays a script as text, use **Save link as** and retain its `.ps1` or `.cs` extension. Do not save a GitHub HTML page as the script. The runtime files match the validated v3.10.1 patch; do not mix them with v3.1 or another helper version.
 
 PnP.PowerShell 1.12.0 is an additional module dependency. The script can obtain it if permitted, or you can pre-stage it as described below. New report/download folders are created automatically. Existing `DocInventoryReports`, `DocInventoryDownloads`, `FormatFixtures` and `Validation` folders are not deployment requirements.
 
@@ -423,25 +433,29 @@ Replace `Path` with an existing document. The result is JSON, not the main scrip
 
 ## What was tested
 
-Validation includes both expected findings and expected uncertainty. The recorded v3.10 validation passed 366 checks:
+The v3.10.1 patch passed **476 offline regression checks**. The path tests used separate .NET hosts with both compatibility switches enabled and disabled; no production host configuration was changed.
 
-| Test suite | Passed checks | Focus |
-| --- | ---: | --- |
-| Native scanner | 116 | CFB/OVBA parsing, bounds, known snapshots and process behavior |
-| Report/scheduler regression | 59 | Batch failure retention, bounded scheduling, correlation, paths and reports |
-| Earlier format coverage | 48 | Public/generated documents and malformed/container cases |
-| Expanded Word formats | 75 | Additional formats, malformed payloads and exception containment |
-| Isolated format/report pipeline | 68 | Child-process results, engine mapping, Excel rows and diagnostics |
+| Test suite | Passed checks |
+| --- | ---: |
+| Native scanner | 38 |
+| Report and scheduler | 59 |
+| Earlier format coverage | 48 |
+| Expanded Word formats | 75 |
+| Isolated format/report pipeline | 68 |
+| Legacy .NET path compatibility | 94 |
+| Modern .NET path compatibility | 94 |
+
+The legacy host reproduced the exact original `FileIOPermission` exception. The corrected code then passed flat and mirrored downloads, twelve folder levels, 455-character paths, Unicode/space/#/% names, hash and length checks, overwrite prevention, junction rejection, cleanup and both scanner execution paths. Tests also exercised the production download function with local SharePoint-shaped test doubles. UNC path normalization was tested; real network-share I/O and every Windows Server release were not tested.
 
 The additional corpus contained 16 pinned public samples—14 Apache POI documents and two oletools clean XML examples—and 13 actual Word SaveAs exports. The complete pipeline processed all 29: 25 complete inspections, four expected review results and no processing failures. Three encrypted documents and one HTML document with a separate Office sidecar required review. Five inspectable containers retained VBA indicators.
 
 Samples were obtained from the pinned [Apache POI document fixtures](https://github.com/apache/poi/tree/07f1631dd66f647aacf2f43e3f408fe033aac4d0/test-data/document) and [oletools XML fixtures](https://github.com/decalage2/oletools/tree/ec10260989dbc48b9109e3d05d22beee19cf2333/tests/test-data/ooxml). The public corpus uses the pinned repository revisions linked here. Sample documents and fixture builders are development resources and are not included in the production ZIP. Word exports were produced with macros forced disabled, using plain input and a previously reviewed benign VBA test project. No VBA was executed.
 
-The live QA library run enumerated 77 items: 60 files and 17 folders. It processed all 57 matching `.doc` files successfully, detected VBA indicators in 47, exported 513 metadata rows and recorded no processing failures. The run completed in approximately 91 seconds. Download hashes, correlation evidence, Excel row counts and paths reaching six folder levels were verified. That timing describes this small QA run; it is not a production sizing estimate.
+**Historical v3.10 live validation:** the earlier QA library run enumerated 77 items: 60 files and 17 folders. It processed all 57 matching `.doc` files successfully, detected VBA indicators in 47, exported 513 metadata rows and recorded no processing failures. The run completed in approximately 91 seconds. Download hashes, correlation evidence, Excel row counts and paths reaching six folder levels were verified. That timing describes the earlier small QA run; it is not a production sizing estimate. The v3.10.1 patch was tested offline and has not had a new live tenant run.
 
 The selected real binary files exercised effective revisions 193, 257 and 274. The scanner maps additional Word binary revisions, but testing did not include an authentic sample from every Word release since 1997. Original deleted v3.8 problem files were unavailable, so their exact byte-level behavior cannot be retrospectively certified.
 
-Microsoft Defender reported no threats in the fixture folder. That result does not guarantee that downloaded files are free of security issues. One development-only inline diagnostic command was blocked by AMSI; protections remained enabled, and the normal scanner/test scripts ran with protections enabled. The public validation summary records this result and its limitations; development fixtures are not part of the runtime download.
+During the earlier v3.10 fixture preparation, Microsoft Defender reported no threats in the fixture folder. That result does not guarantee that downloaded files are free of security issues. One development-only inline diagnostic command was blocked by AMSI; protections remained enabled, and the normal scanner/test scripts ran with protections enabled. The public validation summary records this result and its limitations; development fixtures are not part of the runtime download.
 
 ## Network activity and local retention
 
@@ -455,6 +469,7 @@ Use the recorded evidence to resolve operational issues. Common cases have speci
 
 | Symptom | What to check |
 | --- | --- |
+| `CreateDirectory` reports illegal characters / `FileIOPermission` | Replace all four runtime files with v3.10.1 and start a fresh PowerShell process; do not strip long-path prefixes manually |
 | A different PnP version is already loaded | Start a fresh Windows PowerShell 5.1 STA session and use the pinned dependency |
 | Sign-in fails or no usable MFA window appears | Check the chosen authentication mode and tenant policy; use `SystemBrowser` only with an approved app ID |
 | HTTP 403 | Confirm the signed-in account's access to the target web/library/files and the relevant tenant restrictions |
@@ -477,4 +492,4 @@ Get-Help .\Export-SPOLegacyDocInventory.ps1 -Full
 
 The [deployment README](/scripts/legacy-doc-inventory/README.md), [format coverage matrix](/scripts/legacy-doc-inventory/FORMAT-COVERAGE-v3.10.md), [public validation summary](/scripts/legacy-doc-inventory/VALIDATION-v3.10.json) and [SHA256 checksums](/scripts/legacy-doc-inventory/SHA256SUMS.txt) accompany the release. A practical first run is a folder count, followed by a metadata inventory, then content inspection of the areas that need it.
 
-[Download v3.10](/scripts/legacy-doc-inventory/Export-SPOLegacyDocInventory-v3.10.zip) · [Browse the four source files](https://github.com/pvutla001/pvutla001.github.io/tree/main/scripts/legacy-doc-inventory) · [Return to articles](/#articles)
+[Download v3.10.1](/scripts/legacy-doc-inventory/Export-SPOLegacyDocInventory-v3.10.1.zip) · [Browse the four source files](https://github.com/pvutla001/pvutla001.github.io/tree/main/scripts/legacy-doc-inventory) · [Return to articles](/#articles)

@@ -6,10 +6,13 @@ using System.Text;
 using System.Net;
 using System.Threading;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using Microsoft.SharePoint.Client;
 
 namespace SPOInventoryV310 {
-    public static class BuildInfo { public const string Version = "3.10"; }
+    public static class BuildInfo { public const string Version = "3.10.1"; }
     // One shared gate per run; every worker respects service-wide Retry-After.
     public sealed class RetryGate {
         private readonly object sync = new object();
@@ -59,10 +62,102 @@ namespace SPOInventoryV310 {
     }
 
     public static class LocalIO {
+        // Use Unicode Win32 paths and handle-based streams. Passing a device path
+        // to a .NET Framework string-path API can fail in legacy compatibility mode.
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+        private static extern uint GetFullPathNameW(string path, uint size, StringBuilder buffer, IntPtr part);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+        private static extern uint GetFileAttributesW(string path);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+        private static extern bool CreateDirectoryW(string path, IntPtr security);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+        private static extern bool DeleteFileW(string path);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+        private static extern bool MoveFileW(string source, string destination);
+        [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+        private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        private static IOException Failure(string operation, string path, int code) {
+            return new IOException(operation+" failed (Win32 "+code+") for '"+path+"': "+new Win32Exception(code).Message, new Win32Exception(code));
+        }
+        public static string FullPath(string path) {
+            if(String.IsNullOrWhiteSpace(path)) throw new ArgumentException("Local path is empty.","path");
+            path=path.Replace('/','\\');
+            if(path.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase)) path=@"\\"+path.Substring(8);
+            else if(path.StartsWith(@"\\?\")) path=path.Substring(4);
+            if(path.StartsWith(@"\\.\") || path.StartsWith(@"\??\")) throw new ArgumentException("Device paths are not document paths.","path");
+            for(int i=0;i<path.Length;i++) {
+                char c=path[i];
+                if(c<32 || c=='"' || c=='<' || c=='>' || c=='|' || c=='*' || c=='?' || (c==':' && (i!=1 || !Char.IsLetter(path[0])))) throw new ArgumentException("Invalid character or alternate data stream in local path.","path");
+            }
+            var buffer=new StringBuilder(32768);
+            uint count=GetFullPathNameW(path,(uint)buffer.Capacity,buffer,IntPtr.Zero);
+            if(count==0) throw Failure("Normalize path",path,Marshal.GetLastWin32Error());
+            if(count>=buffer.Capacity || count>32750) throw new PathTooLongException("Local path exceeds the supported Windows path length.");
+            string full=buffer.ToString();
+            int root=RootLength(full); return full.Length>root ? full.TrimEnd('\\') : full;
+        }
+        private static int RootLength(string full) {
+            if(full.Length>=3 && Char.IsLetter(full[0]) && full[1]==':' && full[2]=='\\') return 3;
+            if(full.StartsWith(@"\\")) {
+                int server=full.IndexOf('\\',2); if(server<=2 || server==full.Length-1) throw new ArgumentException("UNC path requires server and share.");
+                int share=full.IndexOf('\\',server+1); return share<0 ? full.Length : share+1;
+            }
+            throw new ArgumentException("Expected a drive or UNC path.");
+        }
         public static string Extended(string path) {
-            if(path.StartsWith(@"\\?\")) return path;
+            path=FullPath(path);
             if(path.StartsWith(@"\\")) return @"\\?\UNC\"+path.Substring(2);
             return @"\\?\"+path;
+        }
+        public static string Parent(string path) {
+            string full=FullPath(path); int root=RootLength(full);
+            if(full.Length<=root) return null;
+            int slash=full.LastIndexOf('\\'); return slash<root ? full.Substring(0,root) : full.Substring(0,slash);
+        }
+        private static uint Attributes(string path, bool allowMissing) {
+            uint value=GetFileAttributesW(Extended(path));
+            if(value!=UInt32.MaxValue) return value;
+            int code=Marshal.GetLastWin32Error();
+            if(allowMissing && (code==2 || code==3)) return UInt32.MaxValue;
+            throw Failure("Read attributes",path,code);
+        }
+        public static bool FileExists(string path) {
+            uint value=Attributes(path,true);
+            return value!=UInt32.MaxValue && (value & (uint)FileAttributes.Directory)==0;
+        }
+        private static void CheckDirectory(string path, uint attributes) {
+            if((attributes & (uint)FileAttributes.Directory)==0) throw new IOException("Directory path is occupied by a file: "+path);
+            if((attributes & (uint)FileAttributes.ReparsePoint)!=0) throw new IOException("Directory link/reparse point refused: "+path);
+        }
+        public static void CreateDirectory(string path) {
+            string full=FullPath(path); int root=RootLength(full);
+            string cursor=full.Substring(0,root); CheckDirectory(cursor,Attributes(cursor,false));
+            foreach(string part in full.Substring(root).Split(new char[]{'\\'},StringSplitOptions.RemoveEmptyEntries)) {
+                cursor=cursor.TrimEnd('\\')+@"\"+part;
+                uint attributes=Attributes(cursor,true);
+                if(attributes==UInt32.MaxValue) {
+                    if(!CreateDirectoryW(Extended(cursor),IntPtr.Zero)) {
+                        int code=Marshal.GetLastWin32Error(); if(code!=183) throw Failure("Create directory",cursor,code);
+                    }
+                    attributes=Attributes(cursor,false);
+                }
+                CheckDirectory(cursor,attributes);
+            }
+        }
+        private static FileStream Open(string path, bool write) {
+            SafeFileHandle handle=CreateFileW(Extended(path),write ? 0x40000000U : 0x80000000U,write ? 0U : 1U,IntPtr.Zero,write ? 1U : 3U,0x08000080U,IntPtr.Zero);
+            if(handle.IsInvalid) { int code=Marshal.GetLastWin32Error(); handle.Dispose(); throw Failure(write ? "Create new file" : "Open file for reading",path,code); }
+            try { return new FileStream(handle,write ? FileAccess.Write : FileAccess.Read,81920,false); }
+            catch { handle.Dispose(); throw; }
+        }
+        public static FileStream OpenRead(string path) { return Open(path,false); }
+        public static FileStream CreateNew(string path) { return Open(path,true); }
+        public static long Length(string path) { using(var stream=OpenRead(path)) return stream.Length; }
+        public static void Delete(string path) {
+            if(!DeleteFileW(Extended(path))) { int code=Marshal.GetLastWin32Error(); if(code!=2 && code!=3) throw Failure("Delete file",path,code); }
+        }
+        public static void Move(string source,string destination) {
+            if(!MoveFileW(Extended(source),Extended(destination))) throw Failure("Move file to "+destination,source,Marshal.GetLastWin32Error());
         }
         private static bool IsReservedDeviceName(string component) {
             string stem=component;
@@ -115,32 +210,30 @@ namespace SPOInventoryV310 {
         public static string Mirror(string root, string relative) {
             if(String.IsNullOrWhiteSpace(root)) throw new ArgumentException("Download root is empty.","root");
             if(relative==null) throw new ArgumentNullException("relative");
-            root=System.IO.Path.GetFullPath(root).TrimEnd('\\');
+            root=FullPath(root).TrimEnd('\\');
             string target=root;
             foreach(string part in relative.Split('/')) {
                 bool changed;
                 string safe=SafeComponent(part,out changed);
-                target=System.IO.Path.Combine(target,safe);
+                target=target+@"\"+safe;
             }
             // Check every existing component, including the root's parents and target.
             string cursor=target;
-            string volume=System.IO.Path.GetPathRoot(root).TrimEnd('\\');
             while(!String.IsNullOrEmpty(cursor)) {
-                try { if((System.IO.File.GetAttributes(Extended(cursor)) & FileAttributes.ReparsePoint)!=0) throw new IOException("Directory link/reparse point refused: "+cursor); }
-                catch(FileNotFoundException) {} catch(DirectoryNotFoundException) {}
-                if(String.Equals(cursor.TrimEnd('\\'),volume,StringComparison.OrdinalIgnoreCase)) break;
-                int slash=cursor.LastIndexOf('\\'); if(slash<3) break; cursor=cursor.Substring(0,slash);
+                uint attributes=Attributes(cursor,true);
+                if(attributes!=UInt32.MaxValue && (attributes & (uint)FileAttributes.ReparsePoint)!=0) throw new IOException("Directory link/reparse point refused: "+cursor);
+                cursor=Parent(cursor);
             }
             return target;
         }
         public static void CopyLimited(Stream input, string destination, long maximum) {
             byte[] buffer=new byte[81920]; long total=0;
-            using(var output=new FileStream(Extended(destination),FileMode.CreateNew,FileAccess.Write,FileShare.None)) {
+            using(var output=CreateNew(destination)) {
                 int read; while((read=input.Read(buffer,0,buffer.Length))>0) { total+=read; if(total>maximum) throw new IOException("Downloaded bytes exceed MaxScanMB."); output.Write(buffer,0,read); }
             }
         }
         public static string Hash(string path) {
-            using(var hash=System.Security.Cryptography.SHA256.Create()) using(var stream=System.IO.File.OpenRead(Extended(path))) return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-","");
+            using(var hash=System.Security.Cryptography.SHA256.Create()) using(var stream=OpenRead(path)) return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-","");
         }
     }
 

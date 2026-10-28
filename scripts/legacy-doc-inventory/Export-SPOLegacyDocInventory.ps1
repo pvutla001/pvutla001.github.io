@@ -3,7 +3,7 @@
 .SYNOPSIS
 Stream a large SharePoint library inventory with bounded parallel metadata/content workers. 
 .DESCRIPTION 
-Version 3.10. Windows PowerShell 5.1 STA; legacy PnP.PowerShell 1.12.0 MFA retained.
+Version 3.10.1. Windows PowerShell 5.1 STA; legacy PnP.PowerShell 1.12.0 MFA retained.
 Default: .doc metadata only, all folder depths. CountOnly retains MaxDepth=2;
 use MaxDepth=-1 for unlimited depth. Folder is a decoded library-relative path.
 One paged discovery request plus up to ThrottleLimit workers; every request batch
@@ -22,6 +22,11 @@ starting watermark are not included. File moves/changes during scanning are poss
 Keep SPOLegacyDocInventory.Engine.ps1 and SPOLegacyDocInventory.Runtime.cs beside
 this script; content checks also require Inspect-LegacyWord.ps1. See the accompanying blog post.
 .NOTES
+Version 3.10.1 fixes legacy .NET path validation for local document I/O,
+including deep Mirror downloads and the isolated scanner. No registry or host
+configuration changes are needed. Keep script/module/report roots short;
+these use standard PowerShell/.NET paths. Replace all four files together and
+start a fresh PowerShell process when upgrading.
 All reports and logs have timestamped names. ReviewAndFailures workbooks contain
 Documents and Diagnostics sheets. Detailed failures are always retained; -Verbose
 also logs every successful document and prints per-document results to the console.
@@ -89,7 +94,7 @@ $diagnosticsWriter=[IO.StreamWriter]::new($diagnosticsPath,$false,[Text.UTF8Enco
 $failureWriter=[IO.StreamWriter]::new($failureLogPath,$false,[Text.UTF8Encoding]::new($false),65536)
 $failureWriter.WriteLine('PER-DOCUMENT ERRORS AND REVIEW ITEMS | Run '+$runId)
 $summary=[ordered]@{
-    ScriptVersion='3.10';RunId=$runId;Started=[DateTimeOffset]::Now.ToString('o');Finished='';Status='Starting'
+    ScriptVersion='3.10.1';RunId=$runId;Started=[DateTimeOffset]::Now.ToString('o');Finished='';Status='Starting'
     LibraryUrl='';SiteUrl='';Account='';Mode=$PSCmdlet.ParameterSetName;FolderScope='';DownloadLayout=$DownloadLayout
     ItemsEnumerated=0L;FilesEnumerated=0L;FoldersEnumerated=0L;MatchedDocFiles=0L;DocFiles=0L
     Succeeded=0L;NeedsReview=0L;Failed=0L;Errors=0L;NotProcessed=0L;Downloaded=0L;DownloadFailures=0L;ScansCompleted=0L;VbaIndicatorsDetected=0L
@@ -223,7 +228,7 @@ function Register-RunFailure($Record,[string]$Stage) {
 function Get-CompletionText {
     $lines=[Collections.Generic.List[string]]::new()
     $lines.Add('==========================================================================')
-    $lines.Add(' SHAREPOINT LEGACY DOCUMENT INVENTORY | v3.10')
+    $lines.Add(' SHAREPOINT LEGACY DOCUMENT INVENTORY | v3.10.1')
     $lines.Add('==========================================================================')
     $lines.Add((' RESULT       : {0}' -f $summary.Status));$lines.Add((' RUN          : {0}' -f $runId))
     $lines.Add((' LIBRARY      : {0}' -f $summary.LibraryUrl));$lines.Add((' SCOPE / MODE : {0} / {1}' -f $summary.FolderScope,$summary.Mode))
@@ -258,7 +263,7 @@ Add-Artifact 'Execution log' $logPath;Add-Artifact 'Full document records (JSONL
 Add-Artifact 'Structured per-document diagnostics' $diagnosticsPath;Add-Artifact 'Detailed failures and review log' $failureLogPath
 Add-Artifact 'Machine-readable run summary' $summaryPath;Add-Artifact 'Readable run summary' $summaryTextPath;Add-Artifact 'Progress snapshot' $progressPath
 try {
-    Write-RunLog "Starting v3.10; $ThrottleLimit batch workers; page size $BatchSize."
+    Write-RunLog "Starting v3.10.1; $ThrottleLimit batch workers; page size $BatchSize."
     if($CountOnly -and $DownloadFiles){throw '-CountOnly cannot be combined with -DownloadFiles.'}
     if($PSVersionTable.PSVersion.Major -ne 5 -or [Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA'){throw 'Run with powershell.exe -NoProfile -STA -File Export-SPOLegacyDocInventory.ps1'}
     $dependencyDir=Join-Path $PSScriptRoot '.dependencies';[void][IO.Directory]::CreateDirectory($dependencyDir);$env:PSModulePath=$dependencyDir+';'+$env:PSModulePath
@@ -269,7 +274,13 @@ try {
         Add-Type -Path $runtimePath -ReferencedAssemblies @('System.dll','System.Core.dll','System.Xml.dll','System.IO.Compression.dll','System.IO.Compression.FileSystem.dll',[Microsoft.SharePoint.Client.ClientContext].Assembly.Location,[Microsoft.SharePoint.Client.ClientRuntimeContext].Assembly.Location)
     }
     if(-not ('SPOInventoryV310.LocalIO' -as [type])){throw 'SPOInventoryV310 runtime failed to load.'}
-    if([SPOInventoryV310.BuildInfo]::Version -ne '3.10'){throw 'Runtime version mismatch. Start a fresh PowerShell process with the complete v3.10 package.'}
+    if([SPOInventoryV310.BuildInfo]::Version -ne '3.10.1'){throw 'Runtime version mismatch. Start a fresh PowerShell process with the complete v3.10.1 package.'}
+    $legacyPaths=$false;$blockLongPaths=$false
+    [void][AppContext]::TryGetSwitch('Switch.System.IO.UseLegacyPathHandling',[ref]$legacyPaths)
+    [void][AppContext]::TryGetSwitch('Switch.System.IO.BlockLongPaths',[ref]$blockLongPaths)
+    $summary['LocalFileIO']='Win32UnicodeWithSafeFileHandle'
+    $summary['HostPathSettings']=@{UseLegacyPathHandling=$legacyPaths;BlockLongPaths=$blockLongPaths}
+    Write-RunLog ('Local document I/O: Windows Unicode APIs; host UseLegacyPathHandling={0}, BlockLongPaths={1} (unchanged).' -f $legacyPaths,$blockLongPaths)
     $summary['ComponentSHA256']=@('Export-SPOLegacyDocInventory.ps1','SPOLegacyDocInventory.Engine.ps1','SPOLegacyDocInventory.Runtime.cs','Inspect-LegacyWord.ps1')|ForEach-Object {$component=Join-Path $PSScriptRoot $_;if(Test-Path -LiteralPath $component){[pscustomobject]@{File=$_;SHA256=(Get-FileHash -LiteralPath $component -Algorithm SHA256).Hash}}}
     if(-not [SPOInventoryV310.LocalIO].GetMethod('CopyLimited',[Reflection.BindingFlags]'Public,Static')){throw 'SPOInventoryV310 runtime validation failed: CopyLimited() is unavailable.'}
     $gate=[SPOInventoryV310.RetryGate]::new()
@@ -283,14 +294,14 @@ try {
     $servicePoint=[Net.ServicePointManager]::FindServicePoint($site);$previousConnectionLimit=$servicePoint.ConnectionLimit
     $servicePoint.ConnectionLimit=[math]::Max($previousConnectionLimit,$ThrottleLimit+1)
     $scan=($CheckVBA -or $CheckMacro -or $CheckBoth);$download=($scan -or $DownloadFiles)
-    $summary['ContentScanner']='NotRequested';if($scan){$summary.ContentScanner='PowerShell-CFB-OVBA-1.4'}
+    $summary['ContentScanner']='NotRequested';if($scan){$summary.ContentScanner='PowerShell-CFB-OVBA-1.4.1'}
     if($scan){Initialize-Scanner}
-    $downloadRoot='';if($download){if(-not $DownloadDirectory){$DownloadDirectory=Join-Path $PSScriptRoot 'DocInventoryDownloads'};$downloadRoot=[IO.Path]::GetFullPath((Join-Path $DownloadDirectory $runId));[void][IO.Directory]::CreateDirectory($downloadRoot)}
+    $downloadRoot='';if($download){if(-not $DownloadDirectory){$DownloadDirectory=Join-Path $PSScriptRoot 'DocInventoryDownloads'};$downloadRoot=[SPOInventoryV310.LocalIO]::FullPath($DownloadDirectory.TrimEnd('\')+'\'+$runId);[SPOInventoryV310.LocalIO]::CreateDirectory($downloadRoot)}
     $summary['DownloadRoot']=$downloadRoot
     if($download){
         # Validate local staging before potentially enumerating thousands of files.
-        $probe=Join-Path $downloadRoot ('.write_test_'+[guid]::NewGuid().ToString('N')+'.tmp')
-        try{[IO.File]::WriteAllText($probe,'ok',[Text.Encoding]::ASCII);[IO.File]::Delete($probe)}
+        $probe=$downloadRoot+'\.write_test_'+[guid]::NewGuid().ToString('N')+'.tmp'
+        try{$probeStream=[SPOInventoryV310.LocalIO]::CreateNew($probe);$probeStream.Dispose();[SPOInventoryV310.LocalIO]::Delete($probe)}
         catch{throw ('Download staging directory is not writable: {0}. {1}' -f $downloadRoot,$_.Exception.Message)}
     }
     if($Connection){$ctx=Get-PnPContext -Connection $Connection}else{

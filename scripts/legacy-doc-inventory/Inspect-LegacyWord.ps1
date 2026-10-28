@@ -5,7 +5,7 @@ Identify and inspect local Word containers using PowerShell and built-in .NET.
 .DESCRIPTION
 Read-only CFB/OVBA, RTF, Word OpenXML, Word XML and MHTML parser. No Python, Word, COM automation, network,
 third-party modules, source export or macro execution. This helper replaces
-Inspect-LegacyWord.py for inventory v3.10. It is not an antivirus or Word validator.
+Inspect-LegacyWord.py for inventory v3.10.1. It is not an antivirus or Word validator.
 Supported scope: Word 97+ OLE hierarchies, recognized RTF embedded OLE objects,
 Word OpenXML/Flat OPC VBA parts, Word 2003 XML and contained MHTML Office data.
 HTML sidecar references remain unresolved; simple text is identified separately.
@@ -29,11 +29,87 @@ https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ovba/575462ba
 param([string]$Path,[string]$ResultPath,[ValidateRange(1,2048)][int]$MaxFileMB=100,
       [ValidateRange(1,1800)][int]$TimeoutSeconds=120)
 
+function Initialize-LwLocalIO {
+    if('LegacyWordPathV3101' -as [type]){return}
+    # Handle-based streams avoid .NET Framework's legacy device-path validation.
+    # This helper uses only Windows/.NET; no SharePoint assembly or extra file.
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class LegacyWordPathV3101 {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+    private static extern uint GetFullPathNameW(string path, uint size, StringBuilder buffer, IntPtr part);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true, ExactSpelling=true)]
+    private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        private static IOException Failure(string operation, string path, int code) {
+            return new IOException(operation+" failed (Win32 "+code+") for '"+path+"': "+new Win32Exception(code).Message, new Win32Exception(code));
+        }
+        public static string FullPath(string path) {
+            if(String.IsNullOrWhiteSpace(path)) throw new ArgumentException("Local path is empty.","path");
+            path=path.Replace('/','\\');
+            if(path.StartsWith(@"\\?\UNC\",StringComparison.OrdinalIgnoreCase)) path=@"\\"+path.Substring(8);
+            else if(path.StartsWith(@"\\?\")) path=path.Substring(4);
+            if(path.StartsWith(@"\\.\") || path.StartsWith(@"\??\")) throw new ArgumentException("Device paths are not document paths.","path");
+            for(int i=0;i<path.Length;i++) {
+                char c=path[i];
+                if(c<32 || c=='"' || c=='<' || c=='>' || c=='|' || c=='*' || c=='?' || (c==':' && (i!=1 || !Char.IsLetter(path[0])))) throw new ArgumentException("Invalid character or alternate data stream in local path.","path");
+            }
+            var buffer=new StringBuilder(32768);
+            uint count=GetFullPathNameW(path,(uint)buffer.Capacity,buffer,IntPtr.Zero);
+            if(count==0) throw Failure("Normalize path",path,Marshal.GetLastWin32Error());
+            if(count>=buffer.Capacity || count>32750) throw new PathTooLongException("Local path exceeds the supported Windows path length.");
+            string full=buffer.ToString();
+            int root=RootLength(full); return full.Length>root ? full.TrimEnd('\\') : full;
+        }
+        private static int RootLength(string full) {
+            if(full.Length>=3 && Char.IsLetter(full[0]) && full[1]==':' && full[2]=='\\') return 3;
+            if(full.StartsWith(@"\\")) {
+                int server=full.IndexOf('\\',2); if(server<=2 || server==full.Length-1) throw new ArgumentException("UNC path requires server and share.");
+                int share=full.IndexOf('\\',server+1); return share<0 ? full.Length : share+1;
+            }
+            throw new ArgumentException("Expected a drive or UNC path.");
+        }
+        public static string Extended(string path) {
+            path=FullPath(path);
+            if(path.StartsWith(@"\\")) return @"\\?\UNC\"+path.Substring(2);
+            return @"\\?\"+path;
+        }
+        private static FileStream Open(string path, bool write) {
+            SafeFileHandle handle=CreateFileW(Extended(path),write ? 0x40000000U : 0x80000000U,write ? 0U : 1U,IntPtr.Zero,write ? 1U : 3U,0x08000080U,IntPtr.Zero);
+            if(handle.IsInvalid) { int code=Marshal.GetLastWin32Error(); handle.Dispose(); throw Failure(write ? "Create new file" : "Open file for reading",path,code); }
+            try { return new FileStream(handle,write ? FileAccess.Write : FileAccess.Read,81920,false); }
+            catch { handle.Dispose(); throw; }
+        }
+        public static FileStream OpenRead(string path) { return Open(path,false); }
+        public static FileStream CreateNew(string path) { return Open(path,true); }
+
+    public static byte[] ReadAllBytes(string path, long maximum) {
+        using(var stream=OpenRead(path)) {
+            if(stream.Length>maximum || stream.Length>Int32.MaxValue) throw new IOException("Input exceeds bounded inspection size limit.");
+            byte[] bytes=new byte[(int)stream.Length]; int offset=0;
+            while(offset<bytes.Length) {
+                int read=stream.Read(bytes,offset,bytes.Length-offset);
+                if(read==0) throw new EndOfStreamException("Input changed or was truncated during inspection.");
+                offset+=read;
+            }
+            if(stream.ReadByte()!=-1) throw new IOException("Input grew during inspection.");
+            return bytes;
+        }
+    }
+}
+'@
+}
 function ConvertTo-LwNativePath([string]$Value) {
-    if($Value.StartsWith('\\?\')){return $Value}
-    $full=[IO.Path]::GetFullPath($Value)
-    if($full.StartsWith('\\')){return '\\?\UNC\'+$full.Substring(2)}
-    return '\\?\'+$full
+    Initialize-LwLocalIO
+    return [LegacyWordPathV3101]::Extended($Value)
+}
+function ConvertTo-LwFullPath([string]$Value) {
+    Initialize-LwLocalIO
+    return [LegacyWordPathV3101]::FullPath($Value)
 }
 function Assert-LwTime($State) {
     if($State.Clock.Elapsed.TotalSeconds -gt $State.Timeout){throw 'Parser time limit exceeded.'}
@@ -303,7 +379,7 @@ function Get-LwCompoundInspection([string]$FilePath,[long]$MaximumBytes=10485760
     $result=[ordered]@{
         SchemaVersion='2.0';Status='Unknown';Format='';VBA='Unknown';Macro='Unknown'
         SourceModules=$null;SourceModulesParsed=0;ProjectCount=$null;ProjectsInspected=0
-        Scanner='PowerShell-CFB-OVBA-1.4';FilePath=[IO.Path]::GetFullPath($FilePath);FileLength=$null;SignatureHex=''
+        Scanner='PowerShell-CFB-OVBA-1.4.1';FilePath=(ConvertTo-LwFullPath $FilePath);FileLength=$null;SignatureHex=''
         DetectionScope='OuterOLEHierarchy';EmbeddedObjects=0;FormatDetails='';FIBVersion=$null;EffectiveFIBVersion=$null;IsTemplate=$null
         ElapsedMilliseconds=0;Error='';ErrorCode='';Diagnostics=@()
         Notes='Static VBA project/source indicators in the outer OLE hierarchy. Not exhaustive WordBasic, packed embedded objects, external-template or compiled-only/stomped-code detection. NotDetected is not a safety verdict.'
@@ -312,7 +388,7 @@ function Get-LwCompoundInspection([string]$FilePath,[long]$MaximumBytes=10485760
     $state=@{Stream=$null;Clock=[Diagnostics.Stopwatch]::StartNew();Timeout=$Seconds;ExpandedBytes=0L;Stage='OpenLocalFile';ProjectPath='';StreamPath='';ModuleName='';FileOffset=$null;CompressedOffset=$null}
     try {
         if($PSBoundParameters.ContainsKey('Content')){$state.Stream=[IO.MemoryStream]::new($Content,$false)}
-        else{$state.Stream=[IO.FileStream]::new((ConvertTo-LwNativePath $FilePath),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)}
+        else{$state.Stream=[LegacyWordPathV3101]::OpenRead($FilePath)}
         $result.FileLength=$state.Stream.Length
         if($state.Stream.Length -gt $MaximumBytes){throw 'File exceeds the configured size limit.'}
         $state.Stage='IdentifyFormat';$header=Read-LwAt $state 0 ([int][math]::Min(512,$state.Stream.Length))
@@ -719,7 +795,7 @@ function Invoke-LwInspection([string]$FilePath,[long]$MaximumBytes=104857600,[in
         Assert-LwTime $state
         if($Depth -gt 3){throw 'Embedded nesting limit exceeded (3 levels).'}
         if($result.FileLength -gt $MaximumBytes -or $result.FileLength -gt 33554432){throw 'Container exceeds bounded inspection size limit (32 MiB).'}
-        if(-not $PSBoundParameters.ContainsKey('Content')){$Content=[IO.File]::ReadAllBytes((ConvertTo-LwNativePath $FilePath))}
+        if(-not $PSBoundParameters.ContainsKey('Content')){$Content=[LegacyWordPathV3101]::ReadAllBytes($FilePath,[math]::Min($MaximumBytes,33554432))}
         if($container -in @('XML','HTML','MHTML','ActiveMime','TextCandidate')){
             Invoke-LwAdditionalContainer $result $Content $FilePath $MaximumBytes $Seconds $Depth $Budget $state $children $issues
         }elseif($container -eq 'RTF'){
@@ -804,8 +880,8 @@ function Get-LegacyWordInspection([string]$FilePath,[long]$MaximumBytes=10485760
     catch{
         $state=@{Stage='InspectionBoundary';ProjectPath='';StreamPath='';ModuleName='';FileOffset=$null;CompressedOffset=$null}
         $diagnostic=New-LwDiagnostic $_ $state 'UnhandledDocumentInspectionError'
-        $identity=$FilePath;try{$identity=[IO.Path]::GetFullPath($FilePath)}catch{}
-        return [pscustomobject][ordered]@{SchemaVersion='2.0';Status='Unknown';Format='Unidentified';VBA='Unknown';Macro='Unknown';SourceModules=$null;SourceModulesParsed=0;ProjectCount=$null;ProjectsInspected=0;Scanner='PowerShell-CFB-OVBA-1.4';FilePath=$identity;FileLength=$null;SignatureHex='';DetectionScope='Incomplete';EmbeddedObjects=0;FormatDetails='Document inspection could not complete; see diagnostics.';FIBVersion=$null;EffectiveFIBVersion=$null;IsTemplate=$null;ElapsedMilliseconds=$clock.ElapsedMilliseconds;Error=$diagnostic.Message;ErrorCode=$diagnostic.Code;Diagnostics=@($diagnostic);Notes='No negative VBA or safety finding can be made from an incomplete inspection.'}
+        $identity=$FilePath;try{$identity=(ConvertTo-LwFullPath $FilePath)}catch{}
+        return [pscustomobject][ordered]@{SchemaVersion='2.0';Status='Unknown';Format='Unidentified';VBA='Unknown';Macro='Unknown';SourceModules=$null;SourceModulesParsed=0;ProjectCount=$null;ProjectsInspected=0;Scanner='PowerShell-CFB-OVBA-1.4.1';FilePath=$identity;FileLength=$null;SignatureHex='';DetectionScope='Incomplete';EmbeddedObjects=0;FormatDetails='Document inspection could not complete; see diagnostics.';FIBVersion=$null;EffectiveFIBVersion=$null;IsTemplate=$null;ElapsedMilliseconds=$clock.ElapsedMilliseconds;Error=$diagnostic.Message;ErrorCode=$diagnostic.Code;Diagnostics=@($diagnostic);Notes='No negative VBA or safety finding can be made from an incomplete inspection.'}
     }
 }
 if($PSBoundParameters.ContainsKey('Path')){
@@ -813,7 +889,7 @@ if($PSBoundParameters.ContainsKey('Path')){
     $result=Get-LegacyWordInspection $Path ([long]$MaxFileMB*1MB) $TimeoutSeconds
     if($ResultPath){
         # Never overwrite an existing path, including the input document by mistake.
-        $output=[IO.FileStream]::new((ConvertTo-LwNativePath $ResultPath),[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $output=[LegacyWordPathV3101]::CreateNew($ResultPath)
         try{$writer=[IO.StreamWriter]::new($output,[Text.UTF8Encoding]::new($false));try{$writer.Write(($result|ConvertTo-Json -Depth 12))}finally{$writer.Dispose()}}finally{$output.Dispose()}
     }else{$result}
 }
