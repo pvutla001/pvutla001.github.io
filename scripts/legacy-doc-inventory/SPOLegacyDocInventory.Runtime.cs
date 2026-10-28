@@ -8,7 +8,8 @@ using System.Threading;
 using System.Collections.Generic;
 using Microsoft.SharePoint.Client;
 
-namespace SPOInventoryV3 {
+namespace SPOInventoryV310 {
+    public static class BuildInfo { public const string Version = "3.10"; }
     // One shared gate per run; every worker respects service-wide Retry-After.
     public sealed class RetryGate {
         private readonly object sync = new object();
@@ -63,12 +64,63 @@ namespace SPOInventoryV3 {
             if(path.StartsWith(@"\\")) return @"\\?\UNC\"+path.Substring(2);
             return @"\\?\"+path;
         }
+        private static bool IsReservedDeviceName(string component) {
+            string stem=component;
+            int dot=stem.IndexOf('.');
+            if(dot>=0) stem=stem.Substring(0,dot);
+            return System.Text.RegularExpressions.Regex.IsMatch(stem,@"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$",System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+        private static string Hex4(char value) { return ((int)value).ToString("X4",System.Globalization.CultureInfo.InvariantCulture); }
+        private static string Hash12(string value) {
+            using(var sha=System.Security.Cryptography.SHA256.Create()) {
+                byte[] digest=sha.ComputeHash(Encoding.UTF8.GetBytes(value));
+                var text=new StringBuilder(12);
+                for(int n=0;n<6;n++) text.Append(digest[n].ToString("x2",System.Globalization.CultureInfo.InvariantCulture));
+                return text.ToString();
+            }
+        }
+        private static string SafeComponent(string original, out bool changed) {
+            if(String.IsNullOrEmpty(original) || original=="." || original=="..") throw new IOException("Empty or relative path component cannot be mirrored.");
+            string normalized=original.Normalize(NormalizationForm.FormC);
+            changed=!String.Equals(original,normalized,StringComparison.Ordinal);
+            char[] invalid=System.IO.Path.GetInvalidFileNameChars();
+            var result=new StringBuilder(normalized.Length+16);
+            for(int n=0;n<normalized.Length;n++) {
+                char c=normalized[n];
+                bool trailing=(n==normalized.Length-1 && (c=='.' || c==' '));
+                bool unsafeChar=c=='~' || c<32 || Array.IndexOf(invalid,c)>=0 || trailing;
+                if(unsafeChar) { result.Append('~').Append(Hex4(c)); changed=true; }
+                else result.Append(c);
+            }
+            string safe=result.ToString();
+            if(IsReservedDeviceName(safe)) { safe="~005F"+safe; changed=true; }
+            // Windows file-system components are normally limited to 255 UTF-16 code units.
+            // Keep margin for the deterministic suffix and avoid splitting a surrogate pair.
+            if(safe.Length>240) {
+                string suffix="~h"+Hash12(original);
+                int keep=240-suffix.Length;
+                if(keep>0 && keep<safe.Length && Char.IsHighSurrogate(safe[keep-1])) keep--;
+                safe=safe.Substring(0,keep)+suffix;
+                changed=true;
+            }
+            if(String.IsNullOrEmpty(safe)) throw new IOException("Path component became empty after Windows-safe mapping.");
+            return safe;
+        }
+        public static bool RequiresMapping(string relative) {
+            if(relative==null) throw new ArgumentNullException("relative");
+            bool any=false;
+            foreach(string part in relative.Split('/')) { bool changed; SafeComponent(part,out changed); any|=changed; }
+            return any;
+        }
         public static string Mirror(string root, string relative) {
+            if(String.IsNullOrWhiteSpace(root)) throw new ArgumentException("Download root is empty.","root");
+            if(relative==null) throw new ArgumentNullException("relative");
             root=System.IO.Path.GetFullPath(root).TrimEnd('\\');
             string target=root;
             foreach(string part in relative.Split('/')) {
-                if(String.IsNullOrEmpty(part) || part=="." || part==".." || part.IndexOfAny(System.IO.Path.GetInvalidFileNameChars())>=0 || part.EndsWith(".") || part.EndsWith(" ") || System.Text.RegularExpressions.Regex.IsMatch(part,@"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)",System.Text.RegularExpressions.RegexOptions.IgnoreCase)) throw new IOException("Cannot mirror Windows filename: "+part);
-                target+="\\"+part;
+                bool changed;
+                string safe=SafeComponent(part,out changed);
+                target=System.IO.Path.Combine(target,safe);
             }
             // Check every existing component, including the root's parents and target.
             string cursor=target;
@@ -116,12 +168,22 @@ namespace SPOInventoryV3 {
             var x=sheet.Xml; x.WriteStartDocument(); x.WriteStartElement("worksheet",ns);
             x.WriteStartElement("sheetViews"); x.WriteStartElement("sheetView"); x.WriteAttributeString("workbookViewId","0");
             x.WriteStartElement("pane"); x.WriteAttributeString("ySplit","1"); x.WriteAttributeString("topLeftCell","A2"); x.WriteAttributeString("state","frozen"); x.WriteEndElement(); x.WriteEndElement(); x.WriteEndElement();
+            x.WriteStartElement("cols");
+            for(int i=0;i<headers.Length;i++) {
+                double width=24;
+                if(headers[i].IndexOf("Path",StringComparison.OrdinalIgnoreCase)>=0 || headers[i]=="Url") width=58;
+                else if(headers[i]=="Message" || headers[i]=="Error" || headers[i]=="Notes" || headers[i]=="Value") width=72;
+                else if(headers[i]=="FileName" || headers[i]=="Property") width=38;
+                x.WriteStartElement("col"); x.WriteAttributeString("min",(i+1).ToString()); x.WriteAttributeString("max",(i+1).ToString()); x.WriteAttributeString("width",width.ToString(System.Globalization.CultureInfo.InvariantCulture)); x.WriteAttributeString("customWidth","1"); x.WriteEndElement();
+            }
+            x.WriteEndElement();
             x.WriteStartElement("sheetData"); sheets.Add(sheet); int index=sheets.Count-1; AddRow(index,headers); return index;
         }
         public void AddRow(int index,string[] values) {
             var s=sheets[index]; if(s.Rows>=1048576) throw new InvalidOperationException("Excel row limit reached; rotate the workbook.");
             s.Rows++; var x=s.Xml; x.WriteStartElement("row"); x.WriteAttributeString("r",s.Rows.ToString());
-            for(int i=0;i<values.Length;i++) { x.WriteStartElement("c"); x.WriteAttributeString("r",Column(i+1)+s.Rows); x.WriteAttributeString("t","inlineStr"); x.WriteStartElement("is"); x.WriteStartElement("t"); x.WriteAttributeString("xml","space",null,"preserve"); x.WriteString(Safe(values[i])); x.WriteEndElement(); x.WriteEndElement(); x.WriteEndElement(); }
+            if(s.Rows==1) { x.WriteAttributeString("ht","30"); x.WriteAttributeString("customHeight","1"); }
+            for(int i=0;i<values.Length;i++) { x.WriteStartElement("c"); x.WriteAttributeString("r",Column(i+1)+s.Rows); x.WriteAttributeString("s",s.Rows==1?"1":(s.Rows%2==0?"2":"0")); x.WriteAttributeString("t","inlineStr"); x.WriteStartElement("is"); x.WriteStartElement("t"); x.WriteAttributeString("xml","space",null,"preserve"); x.WriteString(Safe(values[i])); x.WriteEndElement(); x.WriteEndElement(); x.WriteEndElement(); }
             x.WriteEndElement();
         }
         private static void Put(ZipArchive zip,string name,string text) { using(var writer=new StreamWriter(zip.CreateEntry(name,CompressionLevel.Fastest).Open(),new UTF8Encoding(false))) writer.Write(text); }
@@ -134,6 +196,9 @@ namespace SPOInventoryV3 {
                 var workbook=new StringBuilder("<workbook xmlns=\""+ns+"\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\"><sheets>");
                 var rels=new StringBuilder("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">");
                 for(int i=0;i<sheets.Count;i++) { int n=i+1; var s=sheets[i]; types.Append("<Override PartName=\"/xl/worksheets/sheet"+n+".xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"); workbook.Append("<sheet name=\""+System.Security.SecurityElement.Escape(s.Name)+"\" sheetId=\""+n+"\" r:id=\"rId"+n+"\"/>"); rels.Append("<Relationship Id=\"rId"+n+"\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet"+n+".xml\"/>"); using(var input=System.IO.File.OpenRead(s.Path)) using(var target=zip.CreateEntry("xl/worksheets/sheet"+n+".xml",CompressionLevel.Fastest).Open()) input.CopyTo(target); }
+                types.Append("<Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>");
+                rels.Append("<Relationship Id=\"rStyles\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>");
+                Put(zip,"xl/styles.xml","<styleSheet xmlns=\""+ns+"\"><fonts count=\"2\"><font><sz val=\"11\"/><name val=\"Calibri\"/></font><font><b/><color rgb=\"FFFFFFFF\"/><sz val=\"11\"/><name val=\"Calibri\"/></font></fonts><fills count=\"4\"><fill><patternFill patternType=\"none\"/></fill><fill><patternFill patternType=\"gray125\"/></fill><fill><patternFill patternType=\"solid\"><fgColor rgb=\"FF17365D\"/><bgColor indexed=\"64\"/></patternFill></fill><fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFF0F4F8\"/><bgColor indexed=\"64\"/></patternFill></fill></fills><borders count=\"1\"><border/></borders><cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs><cellXfs count=\"3\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyAlignment=\"1\"><alignment vertical=\"top\" wrapText=\"1\"/></xf><xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"0\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyAlignment=\"1\"><alignment vertical=\"center\" wrapText=\"1\"/></xf><xf numFmtId=\"0\" fontId=\"0\" fillId=\"3\" borderId=\"0\" xfId=\"0\" applyFill=\"1\" applyAlignment=\"1\"><alignment vertical=\"top\" wrapText=\"1\"/></xf></cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles></styleSheet>");
                 Put(zip,"[Content_Types].xml",types+"</Types>"); Put(zip,"xl/workbook.xml",workbook+"</sheets></workbook>"); Put(zip,"xl/_rels/workbook.xml.rels",rels+"</Relationships>");
                 Put(zip,"_rels/.rels","<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>");
             }

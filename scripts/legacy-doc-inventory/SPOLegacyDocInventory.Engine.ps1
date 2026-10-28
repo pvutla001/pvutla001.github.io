@@ -1,7 +1,7 @@
-# Shared pure helpers and worker functions for Export-SPOLegacyDocInventory v3.1.
+# Shared pure helpers and worker functions for Export-SPOLegacyDocInventory v3.1. 
 function Convert-FieldText($Value) {
     if ($null -eq $Value) { return '' }
-    if ($Value -is [datetime]) { return $Value.ToUniversalTime().ToString('o') }
+    if ($Value -is [datetime]) { return (ConvertTo-InventoryUtc $Value) }
     if ($Value -is [string] -or $Value -is [ValueType]) { return [string]$Value }
     if ($Value -is [System.Collections.IEnumerable]) { return (@($Value | ForEach-Object { Convert-FieldText $_ }) -join '; ') }
     if ($Value.PSObject.Properties['LookupValue']) {
@@ -49,6 +49,7 @@ function New-InventoryQueryXml([long]$After,[long]$Through,[string[]]$Fields,[in
 
 function Read-InventoryRange($Context,$Config,[long]$After,[long]$Through,[string[]]$Fields) {
     $query=[Microsoft.SharePoint.Client.CamlQuery]::new()
+    $query.DatesInUtc=$true
     $query.ViewXml=New-InventoryQueryXml $After $Through $Fields $Config.PageSize
     $items=$Context.Web.Lists.GetById([guid]$Config.ListId).GetItems($query)
     $Context.Load($items); $Config.Gate.ExecuteRead($Context,$Config.RetryCount)
@@ -59,6 +60,7 @@ function Get-InventoryPage($Context,$Config,[long]$Cursor) {
     # Unfiltered server paging avoids a broad filter over a >5000-item library.
     # ID ranges are used only for metadata on the already bounded discovered page.
     $query=[Microsoft.SharePoint.Client.CamlQuery]::new()
+    $query.DatesInUtc=$true
     $refs=(@($Config.BaseFields | ForEach-Object {"<FieldRef Name='$([Security.SecurityElement]::Escape($_))'/>"}) -join '')
     $query.ViewXml="<View Scope='RecursiveAll'><Query><OrderBy Override='TRUE'><FieldRef Name='ID' Ascending='TRUE'/></OrderBy></Query><ViewFields>$refs</ViewFields><RowLimit Paged='TRUE'>$($Config.PageSize)</RowLimit></View>"
     if($Config.ContainsKey('PagingInfo') -and $Config.PagingInfo){$position=[Microsoft.SharePoint.Client.ListItemCollectionPosition]::new();$position.PagingInfo=$Config.PagingInfo;$query.ListItemCollectionPosition=$position}
@@ -84,106 +86,184 @@ function Test-NetworkFailure($ErrorRecord) {
     return ($ErrorRecord.Exception.Message -match '(?i)unauthorized|access denied|401|403|429|503|authentication|token.*expir')
 }
 
+function ConvertTo-InventoryUtc($Value) {
+    if($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)){return ''}
+    if($Value -is [datetime]){
+        # SharePoint list-item Modified is UTC. Do not let an Unspecified kind
+        # acquire the workstation's timezone during conversion.
+        $date=$Value;if($date.Kind -eq [DateTimeKind]::Unspecified){$date=[datetime]::SpecifyKind($date,[DateTimeKind]::Utc)}
+        return $date.ToUniversalTime().ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+    }
+    $parsed=[DateTimeOffset]::MinValue
+    if(-not [DateTimeOffset]::TryParse([string]$Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal,[ref]$parsed)){throw "Cannot normalize SharePoint timestamp: $Value"}
+    return $parsed.UtcDateTime.ToString('o',[Globalization.CultureInfo]::InvariantCulture)
+}
+function New-InventoryDocument($Item,$Config) {
+    $v=$Item.Values;$path=$v['FileRef'];$relative=Get-LibraryRelativePath $path $Config.LibraryPath
+    $slash=$relative.LastIndexOf('/');$depth=0;if($slash -ge 0){$depth=Get-RelativeFolderDepth $relative.Substring(0,$slash)}
+    [pscustomobject][ordered]@{
+        ItemId=$Item.Id;UniqueId=$v['UniqueId'];FileName=$v['FileLeafRef'];Url=$Config.Origin+(($path.Split('/')|ForEach-Object{[uri]::EscapeDataString($_)}) -join '/')
+        LibraryRelativePath=$relative;FolderDepth=$depth;SizeBytes=$v['File_x0020_Size'];Modified=$v['Modified']
+        Outcome='Pending';MetadataStatus='Complete';DownloadStatus='NotRequested';LocalPath='';ScanStatus='NotRequested';CorrelationStatus='NotRequested'
+        VBA='NotRequested';VBAProjectCount=$null;VBASourceModules=$null;VBASourceModulesParsed=$null;Macro='NotRequested';Both='NotRequested'
+        Format='';FormatDetails='';DetectionScope='';EmbeddedObjects=$null;FIBVersion=$null;EffectiveFIBVersion=$null;IsTemplate=$null;SignatureHex='';SHA256='';ScannerVersion='';ScanMilliseconds=0;ScanInputPath=''
+        DiscoveryModifiedUtc='';DownloadModifiedUtc='';AfterScanModifiedUtc='';ETagBefore='';ETagAfter='';DownloadedBytes=$null
+        ErrorCode='';ErrorStage='';Error='';Notes='';Diagnostics=[Collections.Generic.List[object]]::new()
+    }
+}
+function ConvertTo-InventoryError($Record,[string]$Stage,[string]$Code,[string]$Severity='Error') {
+    [pscustomobject][ordered]@{Severity=$Severity;Code=$Code;Stage=$Stage;Message=$Record.Exception.Message
+        ExceptionType=$Record.Exception.GetType().FullName;ExceptionDetails=$Record.Exception.ToString()
+        FullyQualifiedErrorId=$Record.FullyQualifiedErrorId;ScriptStackTrace=$Record.ScriptStackTrace}
+}
+function Add-InventoryIssue($Row,$Issue) {
+    $Row.Diagnostics.Add($Issue)
+    $Row.Error=(@($Row.Diagnostics|ForEach-Object{'['+$_.Stage+'] '+$_.Message}) -join ' | ')
+    $Row.ErrorCode=(@($Row.Diagnostics|ForEach-Object{$_.Code}|Select-Object -Unique) -join '; ')
+    $Row.ErrorStage=(@($Row.Diagnostics|ForEach-Object{$_.Stage}|Select-Object -Unique) -join '; ')
+}
+function Set-InventoryOutcome($Row) {
+    if($Row.MetadataStatus -eq 'Failed' -or $Row.DownloadStatus -eq 'Failed'){$Row.Outcome='Failed'}
+    elseif($Row.MetadataStatus -ne 'Complete' -or $Row.Diagnostics.Count -gt 0 -or $Row.ScanStatus -notin @('Scanned','NotRequested')){$Row.Outcome='NeedsReview'}
+    else{$Row.Outcome='Succeeded'}
+}
+function Set-InventoryScanResult($Row,$Result,$Config) {
+    $Row.ScanStatus=$Result.Status;$Row.Format=$Result.Format;$Row.SignatureHex=$Result.SignatureHex
+    $Row.FormatDetails=$Result.FormatDetails;$Row.DetectionScope=$Result.DetectionScope;$Row.EmbeddedObjects=$Result.EmbeddedObjects;$Row.FIBVersion=$Result.FIBVersion
+    $Row.EffectiveFIBVersion=$Result.EffectiveFIBVersion;$Row.IsTemplate=$Result.IsTemplate
+    $Row.ScannerVersion=$Result.Scanner;$Row.ScanMilliseconds=$Result.ElapsedMilliseconds;$Row.ScanInputPath=$Result.FilePath
+    $Row.VBAProjectCount=$Result.ProjectCount;$Row.VBASourceModulesParsed=$Result.SourceModulesParsed
+    if($Result.Notes){$Row.Notes+=(' '+$Result.Notes)}
+    if($Config.CheckVBA){$Row.VBA=$Result.VBA;$Row.VBASourceModules=$Result.SourceModules}
+    if($Config.CheckMacro){$Row.Macro=$Result.Macro}
+    if($Config.CheckBoth){$Row.Both=$Result.Macro}
+    foreach($issue in $Result.Diagnostics){Add-InventoryIssue $Row $issue}
+}
+function Set-InventoryCorrelation($Row,$BeforeModified,$AfterModified,[string]$BeforeEtag,[string]$AfterEtag) {
+    $Row.DiscoveryModifiedUtc=ConvertTo-InventoryUtc $Row.Modified
+    $Row.DownloadModifiedUtc=ConvertTo-InventoryUtc $BeforeModified
+    $Row.AfterScanModifiedUtc=ConvertTo-InventoryUtc $AfterModified
+    $Row.ETagBefore=$BeforeEtag;$Row.ETagAfter=$AfterEtag
+    if(-not $BeforeEtag -or -not $AfterEtag){$Row.CorrelationStatus='Unverified';$code='MissingVersionEvidence';$message='A server ETag was not returned; the downloaded snapshot could not be correlated with the later server version.'}
+    elseif($BeforeEtag -cne $AfterEtag -or $Row.DownloadModifiedUtc -ne $Row.AfterScanModifiedUtc){$Row.CorrelationStatus='ServerChangedDuringScan';$code='ServerVersionChanged';$message='Server version changed between download and post-scan verification. The VBA/format findings describe the retained local snapshot and are preserved; rerun to assess the current server version.'}
+    elseif($Row.DiscoveryModifiedUtc -and $Row.DownloadModifiedUtc -and $Row.DiscoveryModifiedUtc -ne $Row.DownloadModifiedUtc){$Row.CorrelationStatus='MetadataChangedSinceDiscovery';$code='MetadataVersionChanged';$message='List-item Modified changed between discovery and download. The downloaded snapshot was stable through post-scan verification. Review metadata correlation; local content findings remain valid for the recorded SHA256.'}
+    else{$Row.CorrelationStatus='Verified';return}
+    Add-InventoryIssue $Row ([pscustomobject]@{Severity='Warning';Code=$code;Stage='VersionCorrelation';Message=$message;ExceptionType='';ExceptionDetails='';FullyQualifiedErrorId='';ScriptStackTrace='';DiscoveryModifiedUtc=$Row.DiscoveryModifiedUtc;DownloadModifiedUtc=$Row.DownloadModifiedUtc;AfterScanModifiedUtc=$Row.AfterScanModifiedUtc;ETagBefore=$BeforeEtag;ETagAfter=$AfterEtag})
+}
 function Invoke-InventoryScan([string]$Path,$Config) {
     $resultPath=Join-Path $Config.ScannerTemp ([guid]::NewGuid().ToString('N')+'.json')
     $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$Config.ScannerExecutable
     $psi.Arguments='-NoLogo -NoProfile -NonInteractive -File "{0}" -Path "{1}" -ResultPath "{2}" -MaxFileMB {3} -TimeoutSeconds {4}' -f $Config.ScannerHelper,$Path,$resultPath,([long]($Config.MaxBytes/1MB)),$Config.ScanTimeoutSeconds
     $psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
-    $process=[Diagnostics.Process]::Start($psi)
-    $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+    $process=$null
     try {
-        if(-not $process.WaitForExit($Config.ScanTimeoutSeconds*1000)){ $process.Kill();$process.WaitForExit();throw 'Scanner timed out; result Unknown.' }
+        $process=[Diagnostics.Process]::Start($psi)
+        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+        if(-not $process.WaitForExit($Config.ScanTimeoutSeconds*1000)){ $process.Kill();$process.WaitForExit();throw ('Scanner timed out after {0}s. Input={1}; helper={2}; process ID={3}.' -f $Config.ScanTimeoutSeconds,$Path,$Config.ScannerHelper,$process.Id) }
         if($process.ExitCode -ne 0 -or -not [IO.File]::Exists($resultPath)){
-            $detail=$stderr.GetAwaiter().GetResult();if($detail.Length -gt 600){$detail=$detail.Substring(0,600)}
-            throw "PowerShell scanner did not produce a result; result Unknown. $detail"
+            throw ('Scanner process failed. ExitCode={0}; input={1}; helper={2}; stderr={3}; stdout={4}' -f $process.ExitCode,$Path,$Config.ScannerHelper,$stderr.GetAwaiter().GetResult(),$stdout.GetAwaiter().GetResult())
         }
-        return ([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json)
-    } finally {$process.Dispose();if([IO.File]::Exists($resultPath)){[IO.File]::Delete($resultPath)}}
+        $result=[IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
+        if(-not $result.PSObject.Properties['SchemaVersion'] -or $result.SchemaVersion -ne '2.0'){throw 'Scanner result schema mismatch; use the matching v3.10 helper files.'}
+        if([IO.Path]::GetFullPath($result.FilePath) -ine [IO.Path]::GetFullPath($Path)){throw 'Scanner result input path does not match the requested document.'}
+        return $result
+    } finally {if($process){$process.Dispose()};if([IO.File]::Exists($resultPath)){[IO.File]::Delete($resultPath)}}
 }
-
 function Invoke-InventoryDownload($Context,$Config,$Row) {
-    $local=$null;$partial=$null
+    $local=$null;$partial=$null;$stage='PrepareDownload'
     try {
         if([long]$Row.SizeBytes -gt $Config.MaxBytes){throw 'File exceeds MaxScanMB; content not downloaded.'}
-        $local=[SPOInventoryV3.LocalIO]::Mirror($Config.DownloadRoot,$Row.LibraryRelativePath)
-        $native=[SPOInventoryV3.LocalIO]::Extended($local)
+        $safeId=([string]$Row.UniqueId -replace '[^0-9A-Fa-f-]','');if(-not $safeId){$safeId='no-guid'}
+        $layout='Flat';if($Config.ContainsKey('DownloadLayout')){$layout=$Config.DownloadLayout}
+        if($layout -eq 'Mirror'){$local=[SPOInventoryV310.LocalIO]::Mirror($Config.DownloadRoot,$Row.LibraryRelativePath)}
+        else{$local=[IO.Path]::Combine($Config.DownloadRoot,('{0}_{1}.doc' -f [long]$Row.ItemId,$safeId))}
+        $Row.Notes='Local snapshot uses '+$layout+' layout; original SharePoint name/path and local mapping are recorded.'
+        $native=[SPOInventoryV310.LocalIO]::Extended($local)
         if([IO.File]::Exists($native)){throw 'Download target already exists; refusing overwrite.'}
-        $directory=$local.Substring(0,$local.LastIndexOf('\'))
-        [void][IO.Directory]::CreateDirectory([SPOInventoryV3.LocalIO]::Extended($directory))
-        $partial=$directory+'\.inventory_'+[guid]::NewGuid().ToString('N')+'.partial'
+        $directory=[IO.Path]::GetDirectoryName($local);[void][IO.Directory]::CreateDirectory([SPOInventoryV310.LocalIO]::Extended($directory))
+        $partial=[IO.Path]::Combine($directory,'.inventory_'+[guid]::NewGuid().ToString('N')+'.partial')
+        $stage='Download'
         for($attempt=0;;$attempt++) {
             $stream=$null
             try {
                 $file=$Context.Web.GetFileById([guid]$Row.UniqueId);$Context.Load($file)
-                $fileItem=$file.ListItemAllFields;$Context.Load($fileItem);$Config.Gate.ExecuteRead($Context,$Config.RetryCount)
+                # File.ListItemAllFields can return site-local wall time, whereas
+                # discovery CAML returns UTC. Use the identical UTC-enabled query
+                # for every Modified comparison, loaded alongside the File.
+                $snapshotQuery=[Microsoft.SharePoint.Client.CamlQuery]::new();$snapshotQuery.DatesInUtc=$true
+                $snapshotQuery.ViewXml=New-InventoryQueryXml ([long]$Row.ItemId-1) ([long]$Row.ItemId) @('ID','Modified') 1
+                $snapshotItems=$Context.Web.Lists.GetById([guid]$Config.ListId).GetItems($snapshotQuery);$Context.Load($snapshotItems)
+                $Config.Gate.ExecuteRead($Context,$Config.RetryCount)
+                if($snapshotItems.Count -ne 1){throw 'The document list item was not returned for the pre-download version snapshot.'}
                 if($file.Length -gt $Config.MaxBytes){throw 'Current server file exceeds MaxScanMB.'}
+                $beforeEtag=$file.ETag;$beforeModified=$snapshotItems[0].FieldValues['Modified'];$expectedLength=$file.Length
                 $binary=$file.OpenBinaryStream();$Config.Gate.ExecuteRead($Context,$Config.RetryCount);$stream=$binary.Value
                 if($null -eq $stream){throw 'No download stream returned.'}
-                # Compare the same list-item field used in enumeration; File.TimeLastModified
-                # can differ from list-item Modified even for an unchanged file.
-                $beforeEtag=$file.ETag;$beforeModified=Convert-FieldText $fileItem.FieldValues['Modified']
-                [SPOInventoryV3.LocalIO]::CopyLimited($stream,$partial,$Config.MaxBytes)
+                [SPOInventoryV310.LocalIO]::CopyLimited($stream,$partial,$Config.MaxBytes)
                 break
             } catch {
-                if([IO.File]::Exists([SPOInventoryV3.LocalIO]::Extended($partial))){[IO.File]::Delete([SPOInventoryV3.LocalIO]::Extended($partial))}
+                if([IO.File]::Exists([SPOInventoryV310.LocalIO]::Extended($partial))){[IO.File]::Delete([SPOInventoryV310.LocalIO]::Extended($partial))}
                 if($attempt -ge $Config.RetryCount -or -not $Config.Gate.Backoff($_.Exception,$attempt)){throw}
                 $Config.Gate.Wait()
             } finally {if($stream){$stream.Dispose()}}
         }
-        [IO.File]::Move([SPOInventoryV3.LocalIO]::Extended($partial),$native)
-        $Row.DownloadStatus='Downloaded';$Row.LocalPath=$local;$Row.SHA256=[SPOInventoryV3.LocalIO]::Hash($local)
-        if($Config.Scan) {
-            $result=Invoke-InventoryScan $local $Config
-            $Row.ScanStatus=$result.Status;$Row.Format=$result.Format;$Row.Notes=$result.Notes;$Row.Error=$result.Error
-            if($Config.CheckVBA){$Row.VBA=$result.VBA;$Row.VBASourceModules=$result.SourceModules}
-            if($Config.CheckMacro){$Row.Macro=$result.Macro}
-            if($Config.CheckBoth){$Row.Both=$result.Macro}
+        [IO.File]::Move([SPOInventoryV310.LocalIO]::Extended($partial),$native)
+        $Row.DownloadStatus='Downloaded';$Row.LocalPath=$local;$Row.DownloadedBytes=([IO.FileInfo]::new($native)).Length
+        $stage='HashSnapshot';$Row.SHA256=[SPOInventoryV310.LocalIO]::Hash($local)
+        if($Row.DownloadedBytes -ne $expectedLength){Add-InventoryIssue $Row ([pscustomobject]@{Severity='Warning';Code='DownloadSizeChanged';Stage='Download';Message="Expected $expectedLength bytes; received $($Row.DownloadedBytes). Server content may have changed during download."})}
+        if($Config.Scan){
+            $stage='LaunchScanner'
+            try {$result=Invoke-InventoryScan $local $Config;Set-InventoryScanResult $Row $result $Config}
+            catch {$Row.ScanStatus='Unknown';if($Config.CheckVBA){$Row.VBA='Unknown'};if($Config.CheckMacro){$Row.Macro='Unknown'};if($Config.CheckBoth){$Row.Both='Unknown'};Add-InventoryIssue $Row (ConvertTo-InventoryError $_ $stage 'ScannerProcessFailure')}
         }
-        $after=$Context.Web.GetFileById([guid]$Row.UniqueId);$Context.Load($after);$Config.Gate.ExecuteRead($Context,$Config.RetryCount)
-        if($beforeEtag -ne $after.ETag -or $beforeModified -ne $Row.Modified){
-            $Row.ScanStatus='ChangedDuringScan';$Row.Notes+=' Content/metadata changed during enumeration or scan; rerun to correlate.'
-            if($Config.Scan){$Row.VBA='Unknown';$Row.Macro='Unknown';$Row.Both='Unknown'}
-        }
+        $stage='VersionCorrelation'
+        $after=$Context.Web.GetFileById([guid]$Row.UniqueId);$Context.Load($after)
+        $snapshotQuery=[Microsoft.SharePoint.Client.CamlQuery]::new();$snapshotQuery.DatesInUtc=$true
+        $snapshotQuery.ViewXml=New-InventoryQueryXml ([long]$Row.ItemId-1) ([long]$Row.ItemId) @('ID','Modified') 1
+        $snapshotItems=$Context.Web.Lists.GetById([guid]$Config.ListId).GetItems($snapshotQuery);$Context.Load($snapshotItems)
+        $Config.Gate.ExecuteRead($Context,$Config.RetryCount)
+        if($snapshotItems.Count -ne 1){throw 'The document list item was not returned for post-scan version verification.'}
+        Set-InventoryCorrelation $Row $beforeModified $snapshotItems[0].FieldValues['Modified'] $beforeEtag $after.ETag
     } catch {
         if($Row.DownloadStatus -ne 'Downloaded'){$Row.DownloadStatus='Failed'}
-        $Row.Error=$_.Exception.Message
-        if($Config.Scan){$Row.ScanStatus='Unknown';if($Config.CheckVBA){$Row.VBA='Unknown'};if($Config.CheckMacro){$Row.Macro='Unknown'};if($Config.CheckBoth){$Row.Both='Unknown'}}
-        if($partial -and [IO.File]::Exists([SPOInventoryV3.LocalIO]::Extended($partial))){[IO.File]::Delete([SPOInventoryV3.LocalIO]::Extended($partial))}
+        if($stage -eq 'VersionCorrelation'){$Row.CorrelationStatus='Unverified'}
+        Add-InventoryIssue $Row (ConvertTo-InventoryError $_ $stage 'DocumentProcessingError')
+        if($Config.Scan -and $Row.ScanStatus -eq 'NotRequested'){$Row.ScanStatus='Unknown';if($Config.CheckVBA){$Row.VBA='Unknown'};if($Config.CheckMacro){$Row.Macro='Unknown'};if($Config.CheckBoth){$Row.Both='Unknown'}}
+    } finally {
+        if($partial -and [IO.File]::Exists([SPOInventoryV310.LocalIO]::Extended($partial))){try{[IO.File]::Delete([SPOInventoryV310.LocalIO]::Extended($partial))}catch{Add-InventoryIssue $Row (ConvertTo-InventoryError $_ 'CleanupDownload' 'PartialFileCleanupFailed')}}
     }
 }
-
 function Invoke-InventoryBatch($Context,$Config,$Page) {
     $documents=[Collections.Generic.List[object]]::new();$byId=@{};$maps=@{};$statuses=@{}
     foreach($item in $Page.Items) {
         $v=$item.Values;$name=$v['FileLeafRef'];$path=$v['FileRef']
         if([int]$v['FSObjType'] -ne 0 -or [IO.Path]::GetExtension($name) -ine '.doc' -or -not $path.StartsWith($Config.FolderPath+'/',[StringComparison]::OrdinalIgnoreCase)){continue}
         $relative=Get-LibraryRelativePath $path $Config.LibraryPath
-        $row=[pscustomobject][ordered]@{ItemId=$item.Id;UniqueId=$v['UniqueId'];FileName=$name;Url=$Config.Origin+(($path.Split('/') | ForEach-Object {[uri]::EscapeDataString($_)}) -join '/');LibraryRelativePath=$relative;FolderDepth=0;SizeBytes=$v['File_x0020_Size'];Modified=$v['Modified'];MetadataStatus='Complete';DownloadStatus='NotRequested';LocalPath='';ScanStatus='NotRequested';VBA='NotRequested';VBASourceModules='';Macro='NotRequested';Both='NotRequested';Format='';SHA256='';Notes='';Error=''}
-        $slash=$relative.LastIndexOf('/');$row.FolderDepth=0;if($slash -ge 0){$row.FolderDepth=Get-RelativeFolderDepth $relative.Substring(0,$slash)}
+        $row=New-InventoryDocument $item $Config
         $documents.Add($row);$byId[$item.Id]=$row;$maps[$item.Id]=@{};$statuses[$item.Id]=@{}
         foreach($field in $Config.Fields){if($v.ContainsKey($field.InternalName)){$maps[$item.Id][$field.InternalName]=$v[$field.InternalName];$statuses[$item.Id][$field.InternalName]='Read'}}
     }
     if(-not $documents.Count){return [pscustomobject]@{After=$Page.After;Through=$Page.Through;Documents=@();Metadata=@();Errors=0}}
     $extra=@($Config.Fields | Where-Object {$_.InternalName -notin $Config.BaseFields})
-    $networkFailure=$null
+    $networkFailure=$null;$networkDiagnostic=$null;$fieldDiagnostics=@{}
     for($offset=0;$offset -lt $extra.Count;$offset+=$Config.FieldBatchSize) {
         $group=@($extra[$offset..([math]::Min($offset+$Config.FieldBatchSize-1,$extra.Count-1))]);$failure=$networkFailure
         if(-not $failure) {
             try {
                 $items=Read-InventoryRange $Context $Config $Page.After $Page.Through (@('ID')+@($group.InternalName))
                 foreach($item in $items){if($byId.ContainsKey($item.Id)){foreach($field in $group){if($item.FieldValues.ContainsKey($field.InternalName)){$maps[$item.Id][$field.InternalName]=Convert-FieldText $item.FieldValues[$field.InternalName];$statuses[$item.Id][$field.InternalName]='Read'}}}}
-            } catch {$failure=$_.Exception.Message;if(Test-NetworkFailure $_){$networkFailure=$failure}}
+            } catch {$failure=$_.Exception.Message;if(Test-NetworkFailure $_){$networkFailure=$failure;$networkDiagnostic=ConvertTo-InventoryError $_ 'ReadMetadata' 'MetadataRequestFailed'}}
         }
         if($failure) {
             foreach($field in $group) {
-                $fieldError=$networkFailure
+                $fieldError=$networkFailure;$fieldDiagnostic=$networkDiagnostic
                 if(-not $fieldError) {
                     try {
                         $items=Read-InventoryRange $Context $Config $Page.After $Page.Through @('ID',$field.InternalName)
                         foreach($item in $items){if($byId.ContainsKey($item.Id) -and $item.FieldValues.ContainsKey($field.InternalName)){$maps[$item.Id][$field.InternalName]=Convert-FieldText $item.FieldValues[$field.InternalName];$statuses[$item.Id][$field.InternalName]='Read'}}
-                    } catch {$fieldError=$_.Exception.Message;if(Test-NetworkFailure $_){$networkFailure=$fieldError}}
+                    } catch {$fieldError=$_.Exception.Message;$fieldDiagnostic=ConvertTo-InventoryError $_ 'ReadMetadata' 'MetadataRequestFailed';if(Test-NetworkFailure $_){$networkFailure=$fieldError;$networkDiagnostic=$fieldDiagnostic}}
                 }
-                if($fieldError){foreach($row in $documents){$statuses[$row.ItemId][$field.InternalName]='Error: '+$fieldError}}
+                if($fieldError){$fieldDiagnostics[$field.InternalName]=$fieldDiagnostic;foreach($row in $documents){$statuses[$row.ItemId][$field.InternalName]='Error: '+$fieldError}}
             }
         }
     }
@@ -191,11 +271,16 @@ function Invoke-InventoryBatch($Context,$Config,$Page) {
     foreach($row in $documents) {
         foreach($field in $Config.Fields){
             $status='NotReturned';$value='';if($statuses[$row.ItemId].ContainsKey($field.InternalName)){$status=$statuses[$row.ItemId][$field.InternalName]};if($maps[$row.ItemId].ContainsKey($field.InternalName)){$value=$maps[$row.ItemId][$field.InternalName]}
-            if($status -ne 'Read'){$row.MetadataStatus='Partial'}
+            if($status -ne 'Read'){
+                $row.MetadataStatus='Partial'
+                $details=[ordered]@{Severity='Error';Code='MetadataReadIncomplete';Stage='ReadMetadata';Message=($field.InternalName+': '+$status);Field=$field.InternalName}
+                if($fieldDiagnostics.ContainsKey($field.InternalName) -and $fieldDiagnostics[$field.InternalName]){foreach($p in $fieldDiagnostics[$field.InternalName].PSObject.Properties){if($p.Name -ne 'Message'){$details[$p.Name]=$p.Value}}}
+                Add-InventoryIssue $row ([pscustomobject]$details)
+            }
             $metadata.Add([pscustomobject]@{ItemId=$row.ItemId;FileName=$row.FileName;Field=$field.InternalName;DisplayName=$field.DisplayName;Type=$field.Type;Value=$value;Status=$status})
         }
         if($Config.Download){Invoke-InventoryDownload $Context $Config $row}
-        if($row.MetadataStatus -ne 'Complete' -or $row.Error -or $row.ScanStatus -notin @('NotRequested','Scanned')){$errors++}
+        Set-InventoryOutcome $row;if($row.Outcome -ne 'Succeeded'){$errors++}
     }
     return [pscustomobject]@{After=$Page.After;Through=$Page.Through;Documents=$documents.ToArray();Metadata=$metadata.ToArray();Errors=$errors}
 }
@@ -260,7 +345,7 @@ function Import-RequiredModule([string]$Name,[string]$Version) {
         if (-not (Get-PackageProvider NuGet -ListAvailable -ErrorAction SilentlyContinue)) { Install-PackageProvider NuGet -MinimumVersion 2.8.5.201 -Scope CurrentUser -Force | Out-Null }
         Save-Module -Name $Name -RequiredVersion $Version -Repository PSGallery -Path $dependencyDir -Force -ErrorAction Stop
     }
-    Import-Module $Name -RequiredVersion $Version -ErrorAction Stop
+    Import-Module $Name -RequiredVersion $Version -ErrorAction Stop -Verbose:$false
 }
 function Initialize-Scanner {
     if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'Inspect-LegacyWord.ps1'))) { throw 'Inspect-LegacyWord.ps1 must be beside this script.' }

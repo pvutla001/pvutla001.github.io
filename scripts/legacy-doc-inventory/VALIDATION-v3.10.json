@@ -1,0 +1,99 @@
+{
+    "Version":  "3.10",
+    "Scanner":  "PowerShell-CFB-OVBA-1.4",
+    "ValidatedDate":  "2026-10-28",
+    "Status":  "Passed",
+    "Checks":  366,
+    "Suites":  [
+                   {
+                       "Suite":  "NativeScannerTest_20261028_003557",
+                       "Checks":  116,
+                       "Status":  "Passed"
+                   },
+                   {
+                       "Suite":  "Regression_20261028_003532",
+                       "Checks":  59,
+                       "Status":  "Passed"
+                   },
+                   {
+                       "Suite":  "FormatCoverage_20261028_003558",
+                       "Checks":  48,
+                       "Status":  "Passed"
+                   },
+                   {
+                       "Suite":  "WordFormats_20261028_003752",
+                       "Checks":  75,
+                       "Status":  "Passed"
+                   },
+                   {
+                       "Suite":  "WordFormatPipeline_20261028_004232",
+                       "Checks":  68,
+                       "Status":  "Passed"
+                   }
+               ],
+    "AdditionalPublicSamples":  16,
+    "AdditionalWordExports":  13,
+    "Pipeline":  {
+                     "VbaIndicators":  5,
+                     "Files":  29,
+                     "Failed":  0,
+                     "Succeeded":  25,
+                     "ReviewReasons":  [
+                                           "Three encrypted files",
+                                           "One HTML file with an unresolved Office sidecar"
+                                       ],
+                     "NeedsReview":  4
+                 },
+    "LiveQaRun":  {
+                      "VbaIndicators":  47,
+                      "Succeeded":  57,
+                      "MaximumFolderDepth":  6,
+                      "Files":  60,
+                      "ElapsedSeconds":  90.77,
+                      "LibraryItems":  77,
+                      "MetadataRows":  513,
+                      "Folders":  17,
+                      "NeedsReview":  0,
+                      "SnapshotHashesVerified":  57,
+                      "DocFiles":  57,
+                      "AllCorrelationsVerified":  true,
+                      "Formats":  {
+                                      "RTF":  3,
+                                      "Word97PlusOLE":  54
+                                  },
+                      "Failed":  0
+                  },
+    "ComponentSHA256":  [
+                            {
+                                "File":  "Export-SPOLegacyDocInventory.ps1",
+                                "SHA256":  "DD2C6F6DC90BCC21CAE39E9CE3655DAB421C0D15DD09CA53D51797D0BD44DD4B"
+                            },
+                            {
+                                "File":  "SPOLegacyDocInventory.Engine.ps1",
+                                "SHA256":  "503C8B3CBB07C7AB1A1637AB7D4B0EDD56D4619A36DA03ACFAE275B659274909"
+                            },
+                            {
+                                "File":  "SPOLegacyDocInventory.Runtime.cs",
+                                "SHA256":  "94F37B9BAFC9BB53BEE19C7B55ADCBD8341E04056AF6502A4447E40D78D55E4D"
+                            },
+                            {
+                                "File":  "Inspect-LegacyWord.ps1",
+                                "SHA256":  "9BD17822DDCF38AAFB92DD20CCA3105004AC1F320F60EDCFC7747C3ACA1175D8"
+                            }
+                        ],
+    "Security":  {
+                     "NoMacroExecution":  true,
+                     "Note":  "A scan result is not a safety guarantee. One development-only inline diagnostic command was blocked by AMSI; protections remained enabled. Normal scanner/test scripts executed with protections enabled.",
+                     "FixtureDefenderScan":  "No threats reported"
+                 },
+    "Limits":  [
+                   "No 200000-file live benchmark; 1000-record bounded scheduler simulation.",
+                   "Real selected binary fixtures exercised effective revisions 193, 257 and 274, not every historical Word release.",
+                   "No exhaustive WordBasic, external-template, packed embedded package or compiled-only/stomped VBA detection.",
+                   "Original deleted v3.8 failing files unavailable.",
+                   "Unknown, partial, encrypted and parser-limit findings require review.",
+                   "Word Online compatibility and document layout rendering are not certified."
+               ],
+    "Provenance":  "Public fixtures from pinned Apache POI and oletools repositories; Word SaveAs fixtures created with macros forced disabled. Source links and handling are described in the guide.",
+    "Publication":  "Sanitized aggregate evidence only. Tenant URLs, user identities, file records and local evidence paths are not distributed."
+}
